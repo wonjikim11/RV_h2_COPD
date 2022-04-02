@@ -1,0 +1,76 @@
+###########################################################################
+################## Estimating heritability (GCTA: GREML) ##################
+###########################################################################
+
+
+###### Multiple GRMs strategy (GREML-LDMS; suitable for WGS or imputed data)
+## Step 1. Calculating MAF 
+plink2 --bfile test --freq --out test
+
+
+## Step 2. Binning variants based on MAF (This is done in R)
+library(data.table)
+library(dplyr)
+MAF.binning <- data.frame(start=c(-1,0.0001,0.001,0.01,0.1,0.2,0.3,0.4),end=c(0.0001,0.001,0.01,0.1,0.2,0.3,0.4,1))
+mafs <- fread("test.afreq",head=T)
+mafs <- mafs %>%
+  mutate(MAF=ifelse(ALT_FREQS<0.5,ALT_FREQS,1-ALT_FREQS))
+for(bin.idx in 1:8){
+  start <- MAF.binning$start[bin.idx]
+  end <- MAF.binning$end[bin.idx]
+  tmp.mafs <- mafs %>%
+    filter(MAF>=start & MAF<end)
+  write.table(tmp.mafs[,1:2],paste0("bin",bin.idx,".list"),row.names=F,col.names=F,quote=F)
+}
+
+
+## Step 3. calculating LD score for each MAF bin and chromosome (This is done in R. It takes much time. We recommend using multiple threads.)
+get.ldscore <- function(chr,bin.idx){
+  system(paste0("plink2 --bfile test --chr ",chr," --extract bin",bin.idx,".list --make-bed --out test_chr_",chr,"_bin",bin.idx))
+  system(paste0("gcta64 --bfile test_chr_",chr,"_bin",bin.idx," --ld-score --ld-wind 10000 --ld-rsq-cutoff 0 --out test_chr_",chr,"_bin",bin.idx))
+}
+a <- lapply(1:22,function(chr) lapply(1:8,get.ldscore,chr=chr))
+
+
+## Step 4. stratify the SNPs by LD scores of individual SNPs (This is done in R.)
+strat.SNPs <- function(chr,bin.idx){
+  bim <- fread(paste0("test_chr_",chr,"_bin",bin.idx,".bim"))
+  lds <- fread(paste0("test_chr_",chr,"_bin",bin.idx,".score.ld"))
+  med.lds <- median(lds$ldscore,na.rm=T)
+  low.ld.snp <- lds[lds$ldscore <= med.lds,"SNP"]
+  high.ld.snp <- lds[lds$ldscore > med.lds,"SNP"]
+  write.table(data.frame(chr=chr,snp=low.ld.snp),paste0("test_chr_",chr,"_Bin",bin.idx,"_lowLD.list"),row.names=F,col.names=F,quote=F)
+  write.table(data.frame(chr=chr,snp=high.ld.snp),paste0("test_chr_",chr,"_Bin",bin.idx,"_highLD.list"),row.names=F,col.names=F,quote=F)
+  
+  system(paste0("plink2 --bfile test_chr_",chr,"_bin",bin.idx," --extract test_chr_",chr,"_Bin",bin.idx,"_lowLD.list --make-bed --out test_chr_",chr,"_Bin",bin.idx,"_lowLD"))
+  system(paste0("plink2 --bfile test_chr_",chr,"_bin",bin.idx," --extract test_chr_",chr,"_Bin",bin.idx,"_highLD.list --make-bed --out test_chr_",chr,"_Bin",bin.idx,"_highLD"))
+}
+a <- lapply(1:22,function(chr) lapply(1:8,strat.SNPs,chr=chr))
+
+
+## Step 5. making GRMs using SNPs stratified into different groups (This is done in R.)
+make.grms <- function(bin.idx){
+  for(chr in 1:22) system(paste0("echo test_chr_",chr,"_Bin",bin.idx,"_lowLD >> test_Bin",bin.idx,"_lowLD.list"))
+  for(chr in 1:22) system(paste0("echo test_chr_",chr,"_Bin",bin.idx,"_lowLD >> test_Bin",bin.idx,"_lowLD.list"))
+  
+  system(paste0("gcta64 --mbfile test_Bin",bin.idx,"_lowLD.list --make-grm-bin --out test_Bin",bin.idx,"_lowLD"))
+  system(paste0("gcta64 --mbfile test_Bin",bin.idx,"_highLD.list --make-grm-bin --out test_Bin",bin.idx,"_highLD"))
+}
+a <- lapply(1:8,make.grms)
+for(bin.idx in 1:8) for(ld in c("low","high")) system(paste0("echo test_Bin",bin.idx,"_",ld,"LD >> test_grms.list"))
+
+## Step 6. Estimating heritability using multiple GRMs
+gcta64 --mgrm test_grms.list --reml-no-constrain --pheno test_pheno.txt --covar test_covar.txt --qcovar test_qcovar.txt --out test_ldms
+
+
+
+###### Single GRM strategy (GREML-SC)
+## Step 1. making a GRM for rare (MAF < 1%) and common (MAF >= 1%) variants
+plink2 --bfile test --max-maf 0.01 --make-bed --out test_rare
+plink2 --bfile test --maf 0.01 --make-bed --out test_common
+gcta64 --bfile test_rare --make-grm-bin --autosome --out test_rare
+gcta64 --bfile test_common --make-grm-bin --autosome --out test_common
+
+## Step 2. Estimating heritability of rare and common variants
+gcta64 --grm-bin test_rare --reml-no-constrain --pheno test_pheno.txt --covar test_covar.txt --qcovar test_qcovar.txt --out test_rare
+gcta64 --grm-bin test_common --reml-no-constrain --pheno test_pheno.txt --covar test_covar.txt --qcovar test_qcovar.txt --out test_common
